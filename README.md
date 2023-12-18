@@ -1,39 +1,14 @@
 ## About
 
-This is a memcache client library for the Go programming language
-(http://golang.org/).
+This is a fork of the https://github.com/bradfitz/gomemcache
 
-## Example
+## 🤷‍Why ami I doing this?
+In the original repo, the MaxIdleConns only limit idle connections but not the concurrent connections to memcached. So you would have a large number of one-time connections in a moment when high concurrency. As is known to all, memcached connections couldn't close gracefully. There may be a large number of **CLOSE_WAIT** connections in your system.
 
-Install with:
 
-```shell
-$ go get github.com/bradfitz/gomemcache/memcache
-```
+## What's new
+* Limit maximum number of concurrent connections to memcached.
+* Use go channel for connection pool.
+* Keep each connection in pool alive.
 
-Then use it like:
-
-```go
-import (
-    "github.com/bradfitz/gomemcache/memcache"
-)
-
-func main() {
-     mc := memcache.New("10.0.0.1:11211", "10.0.0.2:11211", "10.0.0.3:11212")
-     mc.Set(&memcache.Item{Key: "foo", Value: []byte("my value")})
-
-     it, err := mc.Get("foo")
-     ...
-}
-```
-
-## Full docs, see:
-
-See https://pkg.go.dev/github.com/bradfitz/gomemcache/memcache
-
-Or run:
-
-```shell
-$ godoc github.com/bradfitz/gomemcache/memcache
-```
 
