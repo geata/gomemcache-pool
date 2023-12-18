@@ -70,6 +70,9 @@ const (
 	// DefaultMaxIdleConns is the default maximum number of idle connections
 	// kept for any single address.
 	DefaultMaxIdleConns = 2
+
+	// default of check conn alive interval
+	DefaultKeepAliveInterval = time.Second * 10
 )
 
 const buffered = 8 // arbitrary buffered channel size, for readability
@@ -126,7 +129,11 @@ func New(server ...string) *Client {
 
 // NewFromSelector returns a new Client using the provided ServerSelector.
 func NewFromSelector(ss ServerSelector) *Client {
-	return &Client{selector: ss}
+	return &Client{
+		selector:        ss,
+		closeGoroutine:  make(chan struct{}),
+		keepAliveExited: make(chan struct{}),
+	}
 }
 
 // Client is a memcache client.
@@ -154,8 +161,10 @@ type Client struct {
 
 	selector ServerSelector
 
-	lk       sync.Mutex
-	freeconn map[string][]*conn
+	freeconn map[string]chan *conn
+
+	closeGoroutine  chan struct{}
+	keepAliveExited chan struct{}
 }
 
 // Item is an item to be got or stored in a memcached server.
@@ -207,37 +216,145 @@ func (cn *conn) condRelease(err *error) {
 	if *err == nil || resumableError(*err) {
 		cn.release()
 	} else {
+		// this conn is not work well, return a new conn
+		go func() {
+			cnNew := cn.c.createNewConn(cn.addr)
+			cn.c.putFreeConn(cn.addr, cnNew)
+		}()
+		// release error conn
 		cn.nc.Close()
 	}
+}
+
+// create a new conn, must success or cancel by caller
+func (c *Client) createNewConn(addr net.Addr) *conn {
+	for {
+
+		select {
+		case <-c.closeGoroutine:
+			return nil
+		case <-time.After(time.Second):
+			nc, err := c.dial(addr)
+			if err == nil {
+				return &conn{
+					nc:   nc,
+					addr: addr,
+					rw:   bufio.NewReadWriter(bufio.NewReader(nc), bufio.NewWriter(nc)),
+					c:    c,
+				}
+			}
+		}
+	}
+}
+
+// prepare a conn pool and put in channel
+func (c *Client) PreparePool() {
+	// todo: remove old
+
+	if c.freeconn == nil {
+		c.freeconn = make(map[string]chan *conn)
+	}
+
+	c.selector.Each(func(a net.Addr) error {
+		c.freeconn[a.String()] = make(chan *conn, c.maxIdleConns())
+		for i := 0; i < c.maxIdleConns(); i++ {
+
+			go func() {
+				// c.freeconn[a.String()] <- c.createNewConn(a)
+				c.putFreeConn(a, c.createNewConn(a))
+			}()
+		}
+		return nil
+	})
+
+	c.keepAlive()
+}
+
+// check and keep alive of all conn
+func (c *Client) keepAlive() {
+	keepAliveItem := func(cn *conn, start <-chan struct{}) {
+
+		addr := cn.addr
+		go func() {
+
+			<-start
+			// TODO: cache panic then create new ?
+			if cn.nc.SetDeadline(time.Now().Add(time.Second*1)) == nil {
+				if subPing(cn.rw) == nil {
+					// alive, give conn back
+					c.putFreeConn(addr, cn)
+					return
+				}
+			}
+
+			// disconnected, create new
+			cn.nc.Close()
+			cnNew := c.createNewConn(addr)
+			c.putFreeConn(addr, cnNew)
+		}()
+
+	}
+
+	keepAliveList := func(freelist <-chan *conn) {
+		start := make(chan struct{})
+		defer close(start)
+		for {
+			select {
+			case cn, ok := <-freelist:
+				if !ok {
+					return
+				}
+				keepAliveItem(cn, start)
+			default:
+				return
+			}
+		}
+	}
+
+	// check conn alive
+	go func() {
+		defer close(c.keepAliveExited)
+		for {
+			select {
+			case <-c.closeGoroutine:
+				return
+			case <-time.After(DefaultKeepAliveInterval):
+
+				for _, freelist := range c.freeconn {
+					keepAliveList(freelist)
+				}
+			}
+
+		}
+	}()
 }
 
 func (c *Client) putFreeConn(addr net.Addr, cn *conn) {
-	c.lk.Lock()
-	defer c.lk.Unlock()
-	if c.freeconn == nil {
-		c.freeconn = make(map[string][]*conn)
-	}
-	freelist := c.freeconn[addr.String()]
-	if len(freelist) >= c.maxIdleConns() {
-		cn.nc.Close()
+	if cn == nil {
 		return
 	}
-	c.freeconn[addr.String()] = append(freelist, cn)
+
+	// fmt.Println("memcache: put")
+	// defer fmt.Println("memcache: put ok")
+
+	freelist := c.freeconn[addr.String()]
+
+	select {
+	case freelist <- cn:
+	default:
+		cn.nc.Close()
+	}
+
 }
 
 func (c *Client) getFreeConn(addr net.Addr) (cn *conn, ok bool) {
-	c.lk.Lock()
-	defer c.lk.Unlock()
-	if c.freeconn == nil {
+
+	select {
+	case cn = <-c.freeconn[addr.String()]:
+		return cn, true
+	case <-time.After(time.Second * 5):
 		return nil, false
 	}
-	freelist, ok := c.freeconn[addr.String()]
-	if !ok || len(freelist) == 0 {
-		return nil, false
-	}
-	cn = freelist[len(freelist)-1]
-	c.freeconn[addr.String()] = freelist[:len(freelist)-1]
-	return cn, true
 }
 
 func (c *Client) netTimeout() time.Duration {
@@ -294,19 +411,15 @@ func (c *Client) getConn(addr net.Addr) (*conn, error) {
 	if ok {
 		cn.extendDeadline()
 		return cn, nil
+	} else {
+		return nil, errors.New("no free connection available")
 	}
-	nc, err := c.dial(addr)
-	if err != nil {
-		return nil, err
-	}
-	cn = &conn{
-		nc:   nc,
-		addr: addr,
-		rw:   bufio.NewReadWriter(bufio.NewReader(nc), bufio.NewWriter(nc)),
-		c:    c,
-	}
-	cn.extendDeadline()
-	return cn, nil
+	// cn, err := c.createNewConn(addr)
+	// if err != nil {
+	// 	return nil, err
+	// }
+	// cn.extendDeadline()
+	// return cn, nil
 }
 
 func (c *Client) onItem(item *Item, fn func(*Client, *bufio.ReadWriter, *Item) error) error {
@@ -416,28 +529,30 @@ func (c *Client) flushAllFromAddr(addr net.Addr) error {
 	})
 }
 
+func subPing(rw *bufio.ReadWriter) error {
+	if _, err := fmt.Fprintf(rw, "version\r\n"); err != nil {
+		return err
+	}
+	if err := rw.Flush(); err != nil {
+		return err
+	}
+	line, err := rw.ReadSlice('\n')
+	if err != nil {
+		return err
+	}
+
+	switch {
+	case bytes.HasPrefix(line, versionPrefix):
+		break
+	default:
+		return fmt.Errorf("memcache: unexpected response line from ping: %q", string(line))
+	}
+	return nil
+}
+
 // ping sends the version command to the given addr
 func (c *Client) ping(addr net.Addr) error {
-	return c.withAddrRw(addr, func(rw *bufio.ReadWriter) error {
-		if _, err := fmt.Fprintf(rw, "version\r\n"); err != nil {
-			return err
-		}
-		if err := rw.Flush(); err != nil {
-			return err
-		}
-		line, err := rw.ReadSlice('\n')
-		if err != nil {
-			return err
-		}
-
-		switch {
-		case bytes.HasPrefix(line, versionPrefix):
-			break
-		default:
-			return fmt.Errorf("memcache: unexpected response line from ping: %q", string(line))
-		}
-		return nil
-	})
+	return c.withAddrRw(addr, subPing)
 }
 
 func (c *Client) touchFromAddr(addr net.Addr, keys []string, expiration int32) error {
@@ -761,11 +876,14 @@ func (c *Client) incrDecr(verb, key string, delta uint64) (uint64, error) {
 //
 // After Close, the Client may still be used.
 func (c *Client) Close() error {
-	c.lk.Lock()
-	defer c.lk.Unlock()
 	var ret error
+
+	close(c.closeGoroutine)
+
+	<-c.keepAliveExited
+
 	for _, conns := range c.freeconn {
-		for _, c := range conns {
+		for c := range conns {
 			if err := c.nc.Close(); err != nil && ret == nil {
 				ret = err
 			}
